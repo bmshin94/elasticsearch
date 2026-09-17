@@ -71,7 +71,11 @@ public class HighlightSupportTests extends ESTestCase {
             new Or(EMPTY, qstr, kql),
             match("title", "fox", options("fuzziness", "AUTO")),
             match("title", "fox", options("analyzer", "english")),
-            queryString("fox", options("quote_analyzer", "english"))
+            matchPhrase("body", "quick fox", options("analyzer", "english")),
+            queryString("fox", options("analyzer", "english")),
+            queryString("fox", options("quote_analyzer", "english")),
+            new Kql(EMPTY, of("title: fox"), options("analyzer", "english"), TEST_CFG),
+            new And(EMPTY, match, match("body", "fox", options("analyzer", "english")))
         )) {
             assertTrue(supported.toString(), HighlightSupport.isSupportedImplicitPredicate(supported));
         }
@@ -87,57 +91,30 @@ public class HighlightSupportTests extends ESTestCase {
         }
     }
 
-    public void testUniformAnalyzerAgreement() {
-        Expression unlabeled = match("title", "fox", null);
-        Expression named = match("title", "fox", options("analyzer", "english"));
-        Expression namedAnd = new And(
+    /**
+     * {@code quote_analyzer} is always collected. Leaf {@code analyzer} is omitted when {@code includeLeafAnalyzers}
+     * is false, which is the WITH-override path.
+     */
+    public void testAnalyzerNamesOfSkipsLeafAnalyzersOnRequest() {
+        Expression noOptions = match("title", "fox", null);
+        assertThat(HighlightSupport.analyzerNamesOf(noOptions, true), equalTo(Set.of()));
+        assertThat(HighlightSupport.analyzerNamesOf(noOptions, false), equalTo(Set.of()));
+
+        Expression leafAnalyzer = match("title", "fox", options("analyzer", "english"));
+        assertThat(HighlightSupport.analyzerNamesOf(leafAnalyzer, true), equalTo(Set.of("english")));
+        assertThat(HighlightSupport.analyzerNamesOf(leafAnalyzer, false), equalTo(Set.of()));
+
+        Expression quoteAnalyzers = new Or(
             EMPTY,
-            match("title", "fox", options("analyzer", "english")),
-            match("body", "bar", options("analyzer", "english"))
+            queryString("fox", options("quote_analyzer", "english")),
+            queryString("dog", options("quote_analyzer", "whitespace"))
         );
-        Expression namedOrUnlabeled = new Or(EMPTY, named, match("body", "bar", null));
+        assertThat(HighlightSupport.analyzerNamesOf(quoteAnalyzers, true), equalTo(Set.of("english", "whitespace")));
+        assertThat(HighlightSupport.analyzerNamesOf(quoteAnalyzers, false), equalTo(Set.of("english", "whitespace")));
 
-        assertNull(HighlightSupport.uniformAnalyzerOf(unlabeled));
-        assertThat(HighlightSupport.uniformAnalyzerOf(named), equalTo("english"));
-        assertThat(HighlightSupport.uniformAnalyzerOf(namedAnd), equalTo("english"));
-        assertThat(HighlightSupport.uniformAnalyzerOf(namedOrUnlabeled), equalTo("english"));
-
-        HighlightSupport.requireUniformAnalyzer(unlabeled, null);
-        HighlightSupport.requireUniformAnalyzer(named, "english");
-        HighlightSupport.requireUniformAnalyzer(unlabeled, "english");
-        HighlightSupport.requireUniformAnalyzer(namedAnd, null);
-    }
-
-    public void testRequireUniformAnalyzerRejectsMixedLeaves() {
-        Expression query = new Or(
-            EMPTY,
-            match("title", "fox", options("analyzer", "english")),
-            match("body", "bar", options("analyzer", "whitespace"))
-        );
-        assertNull(HighlightSupport.uniformAnalyzerOf(query));
-        IllegalArgumentException e = expectThrows(
-            IllegalArgumentException.class,
-            () -> HighlightSupport.requireUniformAnalyzer(query, null)
-        );
-        assertThat(
-            e.getMessage(),
-            equalTo(
-                "HIGHLIGHT full-text functions use different analyzers [english, whitespace]; "
-                    + "use the same analyzer for every clause, or write an explicit HIGHLIGHT query using a single analyzer"
-            )
-        );
-    }
-
-    public void testRequireUniformAnalyzerRejectsWithMismatch() {
-        Expression query = match("title", "fox", options("analyzer", "english"));
-        IllegalArgumentException e = expectThrows(
-            IllegalArgumentException.class,
-            () -> HighlightSupport.requireUniformAnalyzer(query, "whitespace")
-        );
-        assertThat(
-            e.getMessage(),
-            equalTo("HIGHLIGHT WITH analyzer [whitespace] does not match analyzer [english] specified by the query; they must be the same")
-        );
+        Expression both = queryString("fox", options("analyzer", "english", "quote_analyzer", "whitespace"));
+        assertThat(HighlightSupport.analyzerNamesOf(both, true), equalTo(Set.of("english", "whitespace")));
+        assertThat(HighlightSupport.analyzerNamesOf(both, false), equalTo(Set.of("whitespace")));
     }
 
     public void testAllHighlightableFieldsFiltersAndDeduplicates() {

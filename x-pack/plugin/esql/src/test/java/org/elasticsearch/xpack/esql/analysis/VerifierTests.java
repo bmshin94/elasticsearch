@@ -5130,6 +5130,13 @@ public class VerifierTests extends AnalyzerTestCase {
         supportsHighlight(fullText()).query(
             "FROM test | HIGHLIGHT MATCH(title, \"fox\", {\"analyzer\": \"standard\"}) ON title WITH { \"analyzer\": \"standard\" }"
         );
+        supportsHighlight(fullText()).query(
+            "FROM test | HIGHLIGHT MATCH(title, \"fox\", {\"analyzer\": \"whitespace\"}) ON title WITH { \"analyzer\": \"keyword\" }"
+        );
+        supportsHighlight(fullText()).query(
+            "FROM test | HIGHLIGHT MATCH(title, \"fox\", {\"analyzer\": \"whitespace\"})"
+                + " OR MATCH(body, \"bar\", {\"analyzer\": \"standard\"}) ON title, body"
+        );
     }
 
     public void testHighlightAnalyzerOption() {
@@ -5149,6 +5156,83 @@ public class VerifierTests extends AnalyzerTestCase {
         supportsHighlight(defaultAnalyzer()).error(
             "FROM test | HIGHLIGHT \"fox AND\" ON first_name WITH { \"analyzer\": 123 }",
             allOf(containsString("Option [analyzer] must be a string"), containsString("Invalid query [fox AND]"))
+        );
+    }
+
+    /** WITH analyzer is accepted even when it differs from the WHERE leaf analyzer. */
+    public void testHighlightWithAnalyzerOverridesBorrow() {
+        assumeHighlightImplicitQueryAndFieldsEnabled();
+        for (String borrowed : List.of("whitespace", "my_custom_analyzer")) {
+            supportsHighlightImplicit(fullText()).query(
+                "FROM test | WHERE MATCH(title, \"fox\", {\"analyzer\": \""
+                    + borrowed
+                    + "\"})"
+                    + " | HIGHLIGHT ON title WITH { \"analyzer\": \"keyword\" }"
+            );
+        }
+    }
+
+    /**
+     * An unresolvable analyzer on an implicit WHERE query reports the "derived its query" message,
+     * not the raw registry failure.
+     */
+    public void testHighlightDerivedAnalyzerNotFoundGetsTargetedMessage() {
+        assumeHighlightImplicitQueryAndFieldsEnabled();
+        for (String query : List.of(
+            "FROM test | WHERE MATCH(title, \"fox\", {\"analyzer\": \"my_custom_analyzer\"}) | HIGHLIGHT ON title",
+            "FROM test | WHERE MATCH(title, \"fox\", {\"analyzer\": \"my_custom_analyzer\"}) AND MATCH(body, \"bar\") | HIGHLIGHT ON body",
+            "FROM test | WHERE QSTR(\"title:\\\"return\\\"\", {\"analyzer\": \"standard\", \"quote_analyzer\": \"my_custom_analyzer\"})"
+                + " | HIGHLIGHT ON title"
+        )) {
+            supportsHighlightImplicit(fullText()).error(
+                query,
+                allOf(
+                    containsString("HIGHLIGHT derived its query from a preceding WHERE"),
+                    containsString("refers to analyzer [my_custom_analyzer]"),
+                    containsString("Per-index custom analyzers cannot be used in HIGHLIGHT"),
+                    not(containsString("[my_custom_analyzer] is not a registered analyzer"))
+                )
+            );
+        }
+    }
+
+    /**
+     * An unresolvable WITH analyzer reports the raw registry failure, even when the implicit WHERE query
+     * names the same missing analyzer.
+     */
+    public void testHighlightWithAnalyzerFailureReportsRawRegistryError() {
+        assumeHighlightImplicitQueryAndFieldsEnabled();
+        for (String borrowed : List.of("whitespace", "my_custom_analyzer")) {
+            supportsHighlightImplicit(fullText()).error(
+                "FROM test | WHERE MATCH(title, \"fox\", {\"analyzer\": \""
+                    + borrowed
+                    + "\"})"
+                    + " | HIGHLIGHT ON title WITH { \"analyzer\": \"my_custom_analyzer\" }",
+                allOf(
+                    containsString("[my_custom_analyzer] is not a registered analyzer"),
+                    not(containsString("Per-index custom analyzers cannot be used in HIGHLIGHT"))
+                )
+            );
+        }
+    }
+
+    public void testHighlightReportsUnregisteredLeafAnalyzerEvenWhenWithOverridesIt() {
+        assumeHighlightImplicitQueryAndFieldsEnabled();
+        supportsHighlight(fullText()).error(
+            "FROM test | HIGHLIGHT MATCH(title, \"fox\", {\"analyzer\": \"not_a_real_analyzer\"}) ON title"
+                + " WITH { \"analyzer\": \"whitespace\" }",
+            containsString("[not_a_real_analyzer] is not a registered analyzer")
+        );
+        supportsHighlight(fullText()).error(
+            "FROM test | HIGHLIGHT QSTR(\"title:\\\"fox\\\"\", {\"quote_analyzer\": \"not_a_real_analyzer\"}) ON title"
+                + " WITH { \"analyzer\": \"whitespace\" }",
+            containsString("[not_a_real_analyzer] is not a registered analyzer")
+        );
+    }
+
+    public void testHighlightMappingAnalyzerUnknownOnNodeFallsBack() {
+        supportsHighlight(analyzer().addIndex("test", "mapping-text-custom-analyzer.json").stripErrorPrefix(true)).query(
+            "FROM test | HIGHLIGHT \"fox\" ON title"
         );
     }
 
@@ -5177,14 +5261,18 @@ public class VerifierTests extends AnalyzerTestCase {
             "FROM test | HIGHLIGHT category > 5 ON title",
             containsString("HIGHLIGHT query must be a full-text function (MATCH, MATCH_PHRASE, QSTR, KQL) or a boolean combination of them")
         );
+        // KNN is a full-text function with no lexical form to highlight, alone or inside a boolean.
         supportsHighlight(fullText()).error(
-            "FROM test | HIGHLIGHT MATCH(title, \"fox\", {\"analyzer\": \"whitespace\"}) ON title WITH { \"analyzer\": \"keyword\" }",
-            containsString("HIGHLIGHT WITH analyzer [keyword] does not match analyzer [whitespace] specified by the query")
+            "FROM test | HIGHLIGHT KNN(vector, [1, 2, 3]) ON title",
+            containsString("HIGHLIGHT query must be a full-text function (MATCH, MATCH_PHRASE, QSTR, KQL)")
         );
         supportsHighlight(fullText()).error(
-            "FROM test | HIGHLIGHT MATCH(title, \"fox\", {\"analyzer\": \"english\"}) OR"
-                + " MATCH(body, \"bar\", {\"analyzer\": \"whitespace\"}) ON title, body",
-            containsString("HIGHLIGHT full-text functions use different analyzers [english, whitespace]")
+            "FROM test | HIGHLIGHT MATCH(title, \"fox\") OR KNN(vector, [1, 2, 3]) ON title",
+            containsString("HIGHLIGHT query must be a full-text function (MATCH, MATCH_PHRASE, QSTR, KQL)")
+        );
+        supportsHighlight(fullText()).error(
+            "FROM test | HIGHLIGHT MATCH(title, \"fox\", {\"analyzer\": \"not_a_real_analyzer\"}) ON title",
+            containsString("[not_a_real_analyzer] is not a registered analyzer")
         );
         supportsHighlight(fullText()).error(
             "FROM test | HIGHLIGHT MATCH(title, \"fox\") ON body",

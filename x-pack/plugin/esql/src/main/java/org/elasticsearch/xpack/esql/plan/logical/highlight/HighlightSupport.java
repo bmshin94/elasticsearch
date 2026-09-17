@@ -45,6 +45,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.elasticsearch.index.query.MatchQueryBuilder.ANALYZER_FIELD;
+import static org.elasticsearch.index.query.QueryStringQueryBuilder.QUOTE_ANALYZER_FIELD;
 
 /** Analysis-time helpers for implicit HIGHLIGHT query and field lists. */
 public final class HighlightSupport {
@@ -65,13 +66,21 @@ public final class HighlightSupport {
 
     /** The leaf's {@code analyzer} option, or {@code null} if absent, not foldable, or unsupported on that leaf type. */
     private static String analyzerNameOf(Expression fullTextLeaf) {
+        // MATCH, MATCH_PHRASE, and QSTR have an analyzer option. KQL does not. Other leaves (KNN) return null
+        // and verifyQueryStructure reports the error.
         Expression options = switch (fullTextLeaf) {
             case SingleFieldFullTextFunction single -> single.options();
             case QueryString queryString -> queryString.options();
-            case Kql kql -> kql.options();
             default -> null;
         };
         return foldedOption(options, ANALYZER_FIELD.getPreferredName());
+    }
+
+    private static String quoteAnalyzerNameOf(Expression fullTextLeaf) {
+        if (fullTextLeaf instanceof QueryString queryString) {
+            return foldedOption(queryString.options(), QUOTE_ANALYZER_FIELD.getPreferredName());
+        }
+        return null;
     }
 
     /** The folded string value of option {@code name} in {@code options}, or {@code null} if absent or not a foldable constant. */
@@ -86,55 +95,27 @@ public final class HighlightSupport {
     }
 
     /**
-     * Analyzer every named full-text leaf agrees on, or {@code null} if none name one or they disagree.
-     * Unlabeled leaves do not constrain the result. Disagreement is reported by {@link #requireUniformAnalyzer}.
+     * Analyzer names the runtime context must resolve for this query.
+     * {@code quote_analyzer} is always included. The query builder keeps that option, so the name has to resolve.
+     * Leaf {@code analyzer} options are included only when {@code includeLeafAnalyzers} is true, because WITH
+     * {@code analyzer} strips them. Names on leaves outside ON are included so the option is validated before
+     * the field lookup.
      */
-    public static @Nullable String uniformAnalyzerOf(Expression query) {
-        Set<String> named = namedLeafAnalyzers(query);
-        return named.size() == 1 ? named.iterator().next() : null;
-    }
-
-    /**
-     * Named leaf analyzers must equal {@code commandAnalyzerName} when set, or all share one name when it is not.
-     *
-     * @throws IllegalArgumentException when they disagree
-     */
-    public static void requireUniformAnalyzer(Expression query, @Nullable String commandAnalyzerName) {
-        Set<String> named = namedLeafAnalyzers(query);
-        if (commandAnalyzerName != null) {
-            for (String leaf : named) {
-                if (leaf.equals(commandAnalyzerName) == false) {
-                    throw new IllegalArgumentException(
-                        "HIGHLIGHT WITH analyzer ["
-                            + commandAnalyzerName
-                            + "] does not match analyzer ["
-                            + leaf
-                            + "] specified by the query; they must be the same"
-                    );
-                }
-            }
-            return;
-        }
-        if (named.size() > 1) {
-            // Do not suggest WITH { "analyzer": ... } here: a single WITH value can never equal two distinct leaf analyzers, so
-            // that advice contradicts the WITH branch above. Point at the only remedy that works instead.
-            throw new IllegalArgumentException(
-                "HIGHLIGHT full-text functions use different analyzers "
-                    + named
-                    + "; use the same analyzer for every clause, or write an explicit HIGHLIGHT query using a single analyzer"
-            );
-        }
-    }
-
-    private static Set<String> namedLeafAnalyzers(Expression query) {
+    public static Set<String> analyzerNamesOf(Expression query, boolean includeLeafAnalyzers) {
         Set<String> names = new LinkedHashSet<>();
         query.forEachDown(FullTextFunction.class, leaf -> {
-            String analyzer = analyzerNameOf(leaf);
-            if (analyzer != null) {
-                names.add(analyzer);
+            if (includeLeafAnalyzers) {
+                addIfPresent(names, analyzerNameOf(leaf));
             }
+            addIfPresent(names, quoteAnalyzerNameOf(leaf));
         });
         return names;
+    }
+
+    private static void addIfPresent(Set<String> names, String name) {
+        if (name != null) {
+            names.add(name);
+        }
     }
 
     /**
